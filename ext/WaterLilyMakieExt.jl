@@ -132,12 +132,12 @@ Keyword arguments:
     - `img`: Save rendered frame(s) as image file(s). Pass a filename `String` with a `.png` extension to save with the
         active backend, e.g. `img="frame.png"`. To save a `.svg` or `.pdf`, pass a `(name, backend)` tuple where `backend` is a
         loaded Makie backend that supports vector output (CairoMakie) (eg. `img=("frame.svg", CairoMakie)`).
+        An optional third tuple element sets the raster pixels per figure-size unit, eg. `img=("frame.png", GLMakie, 2)`.
         If `name` contains a printf integer placeholder (e.g. `img="frame_%04d.png"` or `img=("frame_%04d.svg", CairoMakie)`),
         one image is saved per simulation frame (like `video`, rendered offscreen with no interactive window); otherwise only the last frame is saved.
         Can be combined with `video`. Defaults to `nothing`.
-        Note that figures containing `volume` plots (3D renders) have no vector representation: the `.svg`/`.pdf` embeds a
-        raster of the scene rendered by the *active* backend, so keep a GL backend active (call `GLMakie.activate!()` if
-        CairoMakie was loaded after GLMakie, since the last loaded backend activates itself).
+        Figures with `volume` plots have no vector form: the `.svg`/`.pdf` embeds a raster rendered by the *active*
+        backend, so keep GLMakie active (`GLMakie.activate!()` if CairoMakie was loaded last).
     - `hidedecorations::Bool`: Figures without axis details.
     - `azimuth::Number`: Camera azimuth angle. Find a suitable angle interactively checking `ax.azimuth.val`
     - `elevation::Number`: Camera elevation angle. Find a suitable angle interactively checking `ax.elevation.val`.
@@ -175,7 +175,7 @@ function viz!(sim; f=nothing, duration=nothing, step=0.1, remeasure=true, verbos
 
     d==2 && (@assert !(body2mesh) "body2mesh only allowed for 3D plots (d=3).")
     body2mesh && (@assert !isnothing(Base.get_extension(WaterLily, :WaterLilyMeshingExt)) "If body2mesh=true, Meshing must be loaded.")
-    img_name, img_backend, img_fmt = parse_img(img) # validate and unpack the image spec; img_fmt set => save one image per frame
+    img_name, img_backend, img_fmt, img_ppu = parse_img(img) # validate and unpack the image spec; img_fmt set => save one image per frame
     D = ndims(sim.flow.σ)
     @assert d <= D "Cannot do a 3D plot on a 2D simulation."
     !isnothing(sym) && @assert length(sym) == d "sym kwarg must have length equal to plot dimension d=$d, got $(length(sym))."
@@ -242,7 +242,7 @@ function viz!(sim; f=nothing, duration=nothing, step=0.1, remeasure=true, verbos
                 for (i,tᵢ) in enumerate(range(t₀,t₀+duration;step))
                     step_sim_and_viz!(sim,tᵢ)
                     recordframe!(frame)
-                    isnothing(img_fmt) || save_img(Printf.format(img_fmt,i), img_backend, fig)
+                    isnothing(img_fmt) || save_img(Printf.format(img_fmt,i), img_backend, fig; px_per_unit=img_ppu)
                 end
             end
             println("Video saved to $(abspath(video))")
@@ -250,15 +250,15 @@ function viz!(sim; f=nothing, duration=nothing, step=0.1, remeasure=true, verbos
             new_fig && isnothing(img_fmt) && display(Makie.current_backend().Screen(), fig) # an image series renders offscreen
             for (i,tᵢ) in enumerate(range(t₀,t₀+duration;step))
                 step_sim_and_viz!(sim,tᵢ)
-                isnothing(img_fmt) || save_img(Printf.format(img_fmt,i), img_backend, fig)
+                isnothing(img_fmt) || save_img(Printf.format(img_fmt,i), img_backend, fig; px_per_unit=img_ppu)
             end
         end
-        isnothing(img_fmt) && save_img(img_name, img_backend, fig) # single image: save the last frame (a series is saved in the loop)
+        isnothing(img_fmt) && save_img(img_name, img_backend, fig; px_per_unit=img_ppu) # single image: save the last frame (a series is saved in the loop)
         report_img(img_name, img_fmt)
         return fig, ax
     end
     new_fig && isnothing(img_fmt) && display(Makie.current_backend().Screen(), fig)
-    save_img(isnothing(img_fmt) ? img_name : Printf.format(img_fmt,1), img_backend, fig) # the single rendered frame
+    save_img(isnothing(img_fmt) ? img_name : Printf.format(img_fmt,1), img_backend, fig; px_per_unit=img_ppu) # the single rendered frame
     report_img(img_name, img_fmt)
     return fig, ax
 end
@@ -314,47 +314,47 @@ end
 """
     parse_img(img)
 
-Validate and unpack the `img` image-saving spec into `(name, backend, fmt)`. `img` is either a filename `String`
-(must be `.png`) or a `(name, backend)` tuple (the backend must support the requested extension, e.g. CairoMakie for `.svg`/`.pdf`)
-If `name` contains a printf integer placeholder (eg. `frame_%04d.png`), `fmt` is a `Printf.Format` and one image is saved per simulation frame.
+Validate and unpack the `img` spec — a filename `String` (`.png` only), `(name, backend)`, or
+`(name, backend, px_per_unit)` — into `(name, backend, fmt, px_per_unit)`. A printf placeholder in
+`name` (eg. `frame_%04d.png`) sets `fmt` and saves one image per simulation frame.
 """
-parse_img(img::Nothing) = (nothing, nothing, nothing)
+parse_img(img::Nothing) = (nothing, nothing, nothing, nothing)
 function parse_img(img)
     explicit_backend = img isa Tuple
     name, backend = explicit_backend ? (img[1], img[2]) : (img, Makie.current_backend())
+    px_per_unit = explicit_backend && length(img) >= 3 ? img[3] : nothing
+    isnothing(px_per_unit) || @assert px_per_unit isa Real && px_per_unit > 0 "img px_per_unit must be a positive Real, got $(px_per_unit)."
     ext = lowercase(splitext(name)[2])
     @assert ext in (".png", ".svg", ".pdf") "img name must end in .png, .svg, or .pdf, got \"$name\"."
     @assert explicit_backend || ext == ".png" "Saving a $ext image requires a Makie backend that supports it: pass it as a (name, backend) tuple, eg. img=(\"$name\", CairoMakie). Without a backend only .png is supported."
     fmt = occursin('%', name) ? Printf.Format(name) : nothing # `frame_%04d.png` -> one image per frame
-    return name, backend, fmt
+    return name, backend, fmt, px_per_unit
 end
 
 """
-    save_img(name, backend, fig)
+    save_img(name, backend, fig; px_per_unit=nothing)
 
-Save `fig` to `name` with `backend`, creating the parent directory if needed. Returns the absolute path,
-or `nothing` (no-op) when `name === nothing`.
-
-Vector formats (`.svg`/`.pdf`) cannot represent `volume` plots: CairoMakie has no raycasting and silently
-skips them, leaving a blank canvas. When the figure contains a `Volume` plot, the whole scene (including
-any axis decorations) is instead rasterized by the *active* backend (which must be GL-capable, e.g. GLMakie)
-and the raster is embedded in the vector container.
+Save `fig` to `name` with `backend`, creating the parent directory if needed. Returns the absolute path
+(no-op when `name === nothing`). `px_per_unit` scales raster output relative to the figure size (`nothing`
+keeps the backend default). CairoMakie cannot draw `volume` plots (blank `.svg`/`.pdf`), so figures
+containing one are rasterized by the *active* GL backend (at `px_per_unit`, default 2) and the raster
+is embedded in the vector file.
 """
-save_img(name::Nothing, backend, fig) = nothing
-function save_img(name, backend, fig; px_per_unit=2)
+save_img(name::Nothing, backend, fig; px_per_unit=nothing) = nothing
+function save_img(name, backend, fig; px_per_unit=nothing)
     dir = dirname(name); isempty(dir) || mkpath(dir)
     ext = lowercase(splitext(name)[2])
     if ext in (".svg", ".pdf") && any(p -> p isa Makie.Volume, Makie.collect_atomic_plots(fig.scene))
-        Makie.current_backend() === backend && @warn """Saving a $ext of a figure with a volume plot, but the \
-        active backend ($(nameof(backend))) cannot render volumes: the embedded raster will be blank. \
-        Activate a GL backend first, e.g. GLMakie.activate!()."""
-        buf = Makie.colorbuffer(fig; px_per_unit) # raster render with the active (GL) backend
+        Makie.current_backend() === backend && @warn "Active backend $(nameof(backend)) cannot render volumes (blank raster): activate a GL backend first, e.g. GLMakie.activate!()."
+        buf = Makie.colorbuffer(fig; px_per_unit=something(px_per_unit, 2)) # raster render with the active (GL) backend
         w, h = size(fig.scene)
         scene = Makie.Scene(size=(w, h), camera=Makie.campixel!)
         Makie.image!(scene, (0, w), (0, h), rotr90(buf))
         Makie.save(name, scene; backend)
-    else
+    elseif isnothing(px_per_unit)
         Makie.save(name, fig; backend)
+    else
+        Makie.save(name, fig; backend, px_per_unit)
     end
     return abspath(name)
 end
